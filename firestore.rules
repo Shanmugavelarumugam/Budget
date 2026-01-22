@@ -1,0 +1,132 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 🔐 User must be logged in
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // 🔐 User can access only their own data
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // �‍👩‍👧‍👦 Check if user has shared access to another user's data
+    function hasSharedAccess(ownerId) {
+      return isSignedIn() && 
+        exists(/databases/$(database)/documents/users/$(ownerId)/shared_members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(ownerId)/shared_members/$(request.auth.uid)).data.status == 'accepted';
+    }
+
+    // 🔍 Can read data (owner OR shared member)
+    function canRead(userId) {
+      return isOwner(userId) || hasSharedAccess(userId);
+    }
+
+    // ✍️ Can write data (owner ONLY)
+    function canWrite(userId) {
+      return isOwner(userId);
+    }
+
+    // �🚫 Deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 👤 User root document
+    match /users/{userId} {
+      allow read: if canRead(userId);
+      allow write: if canWrite(userId);
+
+      // 👨‍👩‍👧‍👦 Shared Members (Family/Shared feature)
+      match /shared_members/{memberId} {
+        // Owner can manage all members
+        allow read, write: if isOwner(userId);
+        
+        // Shared member can read their own invitation
+        allow read: if isSignedIn() && request.auth.uid == memberId;
+      }
+
+      // 💸 Transactions
+      match /transactions/{transactionId} {
+
+        // Read own transactions OR shared access
+        allow read: if canRead(userId);
+
+        // Create transaction (owner only)
+        allow create: if canWrite(userId)
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.amount is number
+          && request.resource.data.amount > 0
+          && request.resource.data.type in ['income', 'expense']
+          && request.resource.data.date is timestamp;
+
+        // Update transaction (owner only, cannot change owner)
+        allow update: if canWrite(userId)
+          && request.resource.data.userId == resource.data.userId;
+
+        // Delete transaction (owner only)
+        allow delete: if canWrite(userId);
+      }
+
+      // 🏷️ Categories (if user-specific)
+      match /categories/{categoryId} {
+        allow read: if canRead(userId);
+        allow write: if canWrite(userId);
+      }
+
+      // 💰 Budgets
+      match /budgets/{budgetId} {
+        allow read: if canRead(userId);
+        allow write: if canWrite(userId);
+
+        // 📊 Category Budgets (subcollection under budgets)
+        match /categories/{categoryId} {
+          // Read category budgets
+          allow read: if canRead(userId);
+
+          // Create category budget (owner only)
+          allow create: if canWrite(userId)
+            && request.resource.data.categoryId is string
+            && request.resource.data.amount is number
+            && request.resource.data.amount >= 0
+            && request.resource.data.month is string;
+
+          // Update category budget (owner only)
+          allow update: if canWrite(userId)
+            && request.resource.data.amount >= 0;
+
+          // Delete category budget (owner only)
+          allow delete: if canWrite(userId);
+        }
+      }
+
+      // 🎯 Goals
+      match /goals/{goalId} {
+        allow read: if canRead(userId);
+        allow write: if canWrite(userId);
+      }
+
+      // 🔔 Alerts
+      match /alerts/{alertId} {
+        allow read: if canRead(userId);
+        allow write: if canWrite(userId);
+      }
+
+      // 📊 Audit Trail (optional - for tracking shared member views)
+      match /audit_logs/{logId} {
+        // Owner can read all audit logs
+        allow read: if isOwner(userId);
+        
+        // System can create audit logs (via Cloud Functions)
+        // Shared members cannot directly write audit logs
+        allow create: if canRead(userId)
+          && request.resource.data.timestamp is timestamp
+          && request.resource.data.action is string
+          && request.resource.data.userId is string;
+      }
+    }
+  }
+}
